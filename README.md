@@ -1,6 +1,6 @@
 # 🔐 Spring Security - JWT Authentication REST API
 
-A production-ready **Spring Boot 4.1.0** REST API demonstrating authentication and authorization using **Spring Security 7.1.0**, **BCrypt password encoding**, **JPA (MySQL)**, and **JWT (JSON Web Token)** setup.
+A production-ready **Spring Boot 4.1.0** REST API demonstrating authentication and authorization using **Spring Security 7.1.0**, **BCrypt password encoding**, **JPA (MySQL)**, and **JWT (JSON Web Token)** based stateless authentication.
 
 > Built as a learning project to understand Spring Security internals — from filter chains to custom authentication providers.
 
@@ -47,6 +47,7 @@ Client (Postman / Frontend)
 │  → SecurityContextHolderFilter                    │
 │  → HeaderWriterFilter                             │
 │  → LogoutFilter                                   │
+│  → JwtFilter (custom, before BasicAuth) ★ NEW     │
 │  → BasicAuthenticationFilter                      │
 │  → AnonymousAuthenticationFilter                  │
 │  → ExceptionTranslationFilter                     │
@@ -67,6 +68,8 @@ Client (Postman / Frontend)
 │       │                   │                       │
 │       ▼                   ▼                       │
 │  UserRepository ◄──── JPA / MySQL                 │
+│                                                   │
+│  JWTService ──→ JJWT (HmacSHA256)  ★ NEW         │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -80,7 +83,8 @@ src/main/java/com/jai/SpringSecurity/
 ├── SpringSecurityApplication.java          # Main entry point
 │
 ├── config/
-│   └── SecurityConfig.java                 # Security filter chain, AuthProvider, AuthManager
+│   ├── SecurityConfig.java                 # Security filter chain, AuthProvider, AuthManager
+│   └── JwtFilter.java                     # ★ OncePerRequestFilter — extracts & validates JWT
 │
 ├── Controller/
 │   ├── UserController.java                 # /register, /login endpoints
@@ -92,7 +96,8 @@ src/main/java/com/jai/SpringSecurity/
 │   └── Student.java                        # In-memory student model
 │
 ├── Service/
-│   ├── UserService.java                    # Business logic: register & verify (authenticate)
+│   ├── UserService.java                    # Business logic: register & verify (returns JWT)
+│   ├── JWTService.java                    # ★ Token generation, parsing & validation (JJWT)
 │   └── MyUserDetailsService.java           # Custom UserDetailsService - loads user from DB
 │
 └── Repository/
@@ -108,14 +113,14 @@ src/main/java/com/jai/SpringSecurity/
 | Method | Endpoint | Description | Request Body |
 |---|---|---|---|
 | `POST` | `/register` | Register a new user | `{"username": "sam", "password": "s@123"}` |
-| `POST` | `/login` | Authenticate & get response | `{"username": "sam", "password": "s@123"}` |
+| `POST` | `/login` | Authenticate & receive JWT token | `{"username": "sam", "password": "s@123"}` |
 
 ### Protected Endpoints (Authentication Required)
 
 | Method | Endpoint | Description | Auth |
 |---|---|---|---|
-| `GET` | `/student` | Get all students | HTTP Basic |
-| `POST` | `/student` | Add a student | HTTP Basic |
+| `GET` | `/student` | Get all students | Bearer JWT |
+| `POST` | `/student` | Add a student | Bearer JWT |
 | `GET` | `/csrf-token` | Get CSRF token (disabled) | HTTP Basic |
 
 ---
@@ -140,8 +145,24 @@ src/main/java/com/jai/SpringSecurity/
 5. MyUserDetailsService loads user from DB via UserRepository.findByUsername()
 6. User is wrapped in UserPrinciple (implements UserDetails)
 7. BCryptPasswordEncoder.matches(rawPassword, encodedPassword) is called
-8. If match → Authentication SUCCESS → returns "success"
-9. If no match → BadCredentialsException → returns 401
+8. If match → Authentication SUCCESS → JWTService.generateToken(username)
+9. JWT token returned to client (signed with HmacSHA256)
+10. If no match → BadCredentialsException → returns 401
+```
+
+### Accessing Protected Resources (Bearer Token)
+```
+1. Client sends request with header: Authorization: Bearer <jwt_token>
+2. JwtFilter (OncePerRequestFilter) intercepts the request
+3. Extracts token from "Bearer " prefix in Authorization header
+4. JWTService.extractUserName(token) parses the JWT claims
+5. Loads UserDetails from DB via MyUserDetailsService
+6. JWTService.validateToken() checks:
+   a. Username in token matches the loaded UserDetails
+   b. Token is not expired (expiration claim vs current time)
+7. If valid → Sets UsernamePasswordAuthenticationToken in SecurityContextHolder
+8. Request proceeds to the controller
+9. If invalid → Request continues without authentication → 401/403
 ```
 
 ### How Password Verification Works
@@ -207,7 +228,7 @@ Content-Type: application/json
 }
 ```
 
-**Login:**
+**Login (get JWT token):**
 ```bash
 POST http://localhost:8080/login
 Content-Type: application/json
@@ -216,13 +237,13 @@ Content-Type: application/json
     "username": "sam",
     "password": "s@123"
 }
-# Response: "success"
+# Response: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOi..."  (JWT token)
 ```
 
-**Access Protected Resource:**
+**Access Protected Resource (with JWT):**
 ```bash
 GET http://localhost:8080/student
-Authorization: Basic c2FtOnNAMTIz    # sam:s@123 in Base64
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOi...
 ```
 
 ---
@@ -260,9 +281,33 @@ http.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationP
 ### 6. Spring Security Filter Chain (Order Matters!)
 ```
 Request → DisableEncodeUrlFilter → SecurityContextHolderFilter → HeaderWriterFilter
-→ LogoutFilter → BasicAuthenticationFilter → AnonymousAuthenticationFilter
+→ LogoutFilter → ★ JwtFilter → BasicAuthenticationFilter → AnonymousAuthenticationFilter
 → ExceptionTranslationFilter → AuthorizationFilter → Controller
 ```
+> JwtFilter is registered **before** `UsernamePasswordAuthenticationFilter` so JWT tokens are validated before any other authentication mechanism kicks in.
+
+### 8. How JWT Token Generation Works
+```
+1. JWTService constructor generates a random HmacSHA256 secret key at startup
+2. On login, generateToken() creates a JWT with:
+   - Subject: username
+   - IssuedAt: current timestamp
+   - Expiration: current time + 30 minutes
+   - Signed with the HMAC-SHA256 secret key
+3. Token is returned as a compact Base64-encoded string
+```
+
+### 9. How JwtFilter Validates Requests
+```java
+// Registered before UsernamePasswordAuthenticationFilter
+.addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class)
+```
+- Extends `OncePerRequestFilter` — runs exactly once per request
+- Checks for `Authorization: Bearer <token>` header
+- Extracts username from token → loads `UserDetails` from DB
+- Validates token (username match + not expired)
+- Sets `SecurityContextHolder` authentication if valid
+- Uses `ApplicationContext` to lazily fetch `MyUserDetailsService` (avoids circular dependency)
 
 ### 7. `permitAll()` vs `authenticated()`
 ```java
@@ -273,6 +318,17 @@ Request → DisableEncodeUrlFilter → SecurityContextHolderFilter → HeaderWri
 ---
 
 ## 📝 Changelog
+
+### v1.2.0 — JWT Token Authentication (2026-06-25)
+- ✅ Created `JWTService` — generates, parses, and validates JWT tokens using JJWT 0.12.6
+- ✅ Created `JwtFilter` — custom `OncePerRequestFilter` that intercepts requests and validates Bearer tokens
+- ✅ `POST /login` now returns a signed JWT token instead of `"success"`
+- ✅ Protected endpoints now accept `Authorization: Bearer <token>` header
+- ✅ JWT signed with HmacSHA256 (random key generated at startup)
+- ✅ Token expiration set to 30 minutes
+- ✅ Token validation checks: username match + expiration
+- ✅ `JwtFilter` registered before `UsernamePasswordAuthenticationFilter` in the filter chain
+- ✅ `SecurityContextHolder` populated from JWT for downstream authorization
 
 ### v1.1.0 — Login & Registration with DB Authentication (2026-06-22)
 - ✅ Added `POST /login` endpoint with `AuthenticationManager` verification
@@ -299,11 +355,14 @@ Request → DisableEncodeUrlFilter → SecurityContextHolderFilter → HeaderWri
 
 ## 🔮 Upcoming Features
 
-- [ ] JWT token generation on `/login` (using JJWT library)
-- [ ] JWT filter for token-based request authentication
+- [x] ~~JWT token generation on `/login` (using JJWT library)~~ ✅ Done in v1.2.0
+- [x] ~~JWT filter for token-based request authentication~~ ✅ Done in v1.2.0
 - [ ] Role-based access control (`ADMIN`, `USER`)
 - [ ] Refresh token mechanism
 - [ ] Global exception handling with proper error responses
+- [ ] Externalize JWT secret key (environment variable / `application.properties`)
+- [ ] Configurable token expiration time
+- [ ] Logout / token blacklisting
 
 ---
 
